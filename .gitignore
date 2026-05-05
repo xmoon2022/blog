@@ -1,0 +1,7 @@
+_site/
+dist/
+__pycache__/
+.direnv/
+.envrc
+result
+result-*
