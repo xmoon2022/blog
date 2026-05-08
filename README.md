@@ -24,6 +24,12 @@ python scripts/build.py --check
 python scripts/build.py
 ```
 
+或者直接使用
+
+```sh
+nix develop -c python scripts/build.py
+```
+
 输出目录：
 
 - `_site/`：GitHub Pages 发布目录。
