@@ -1,11 +1,8 @@
 use anyhow::{Context, Result, bail, ensure};
-use core::error;
-use core::slice;
 use serde::Deserialize;
-use serde::de;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug)]
@@ -63,9 +60,9 @@ pub struct SiteConfigFile {
 }
 
 impl SiteConfigFile {
-    fn new(config: Config) -> Result<SiteConfigFile, Box<dyn error::Error>> {
-        let content = std::fs::read_to_string("site.toml")?;
-        let file_config: SiteConfigFile = toml::from_str(&content)?;
+    fn new(path: PathBuf) -> Result<SiteConfigFile> {
+        let content = std::fs::read_to_string(path).context("没有找到 site.toml")?;
+        let file_config: SiteConfigFile = toml::from_str(&content).context("解析site.toml失败")?;
         let base_url = std::env::var("SITE_URL")
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -178,72 +175,85 @@ fn discover() -> Result<Vec<Post>> {
     Ok(posts)
 }
 
-pub fn run(config: Config) -> Result<(), Box<dyn error::Error>> {
-    let siteconfig = SiteConfigFile::new(config);
-    println!("{:#?}", siteconfig);
-    let mut posts: Vec<PathBuf> = Vec::new();
-    for entry in fs::read_dir("posts")? {
-        let entry = entry?;
-        let path = entry.path();
+fn clean_dir(path: &PathBuf) -> Result<()> {
+    if path.exists() {
+        fs::remove_dir_all(path.as_path())?;
+    }
+    fs::create_dir_all(path)?;
+    Ok(())
+}
 
-        if path.extension().and_then(|s| s.to_str()) == Some("typ") {
-            posts.push(path);
+fn copy_tree_if_exists(src: PathBuf, dst: PathBuf) -> Result<()> {
+    if !src.exists() {
+        bail!("源目录不存在: {}", src.display());
+    }
+    if dst.exists() {
+        fs::remove_dir_all(&dst).context(format!("删除目标目录失败: {}", &dst.display()))?; // 删除整个目标目录
+    }
+    fn copy_dir(src: PathBuf, dst: PathBuf) -> Result<()> {
+        fs::create_dir_all(&dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+            if file_type.is_dir() {
+                copy_dir(src_path, dst_path)?;
+            } else {
+                fs::copy(&src_path, &dst_path)?;
+            }
         }
+        Ok(())
     }
-    println!("{:#?}", posts);
-    let output = Command::new("typst")
-        .args([
-            "query",
-            "--features",
-            "html",
-            "--target",
-            "html",
-            "--root",
-            ".",
-            "posts/001-为什么决定写博客.typ",
-            "<post-meta>",
-            "--one",
-        ])
-        .current_dir(".")
-        .output()?;
+    copy_dir(src, dst)?;
+    Ok(())
+}
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("typst query failed: {stderr}").into());
-    }
+fn build(siteconfig: SiteConfigFile, site_path: PathBuf, dist_path: PathBuf) -> Result<()> {
+    let posts = discover().context("discover运行失败")?;
+    let mut published_posts: Vec<&Post> = posts.iter().filter(|t| !t.draft).collect();
+    published_posts.sort_by(|a, b| a.date.cmp(&b.date));
+    clean_dir(&site_path)?;
+    clean_dir(&dist_path)?;
+    let mut assets_path = site_path;
+    assets_path.push("assets");
+    copy_tree_if_exists(PathBuf::from("assets"), assets_path)?;
+    for post in published_posts {}
+    Ok(())
+}
 
-    let stdout = String::from_utf8(output.stdout)?;
-    let value: serde_json::Value = serde_json::from_str(&stdout)?;
-    println!("{}", serde_json::to_string_pretty(&value)?);
-
-    let meta = value.get("value").context("JSON 中没有 value 字段")?;
-
-    let slug = meta
-        .get("slug")
-        .and_then(|v| v.as_str())
-        .context("metadata 中没有有效的 slug 字段")?;
-
-    let title = meta
-        .get("title")
-        .and_then(|v| v.as_str())
-        .context("metadata 中没有有效的 title 字段")?;
-
-    println!("slug = {}", slug);
-    println!("title = {}", title);
-
+pub fn run(config: Config) -> Result<()> {
+    let siteconfig = SiteConfigFile::new(PathBuf::from("site.toml"))?;
+    build(siteconfig, config.site_dir, config.dist_dir)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[test]
-    fn test_post() -> anyhow::Result<()> {
-        let posts = discover()?;
-        for post in posts {
-            dbg!(post);
-        }
+    fn test_file_missing() {
+        let path = Path::new("this_file_does_not_exist.toml").to_path_buf();
+        let result = SiteConfigFile::new(path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("没有找到"));
+    }
+
+    #[test]
+    fn test_invalid_toml() -> Result<()> {
+        let mut tmp = NamedTempFile::new()?;
+        tmp.write_all(b"this is not toml")?;
+        let path = tmp.path().to_path_buf();
+
+        let result = SiteConfigFile::new(path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("解析site.toml失败"));
+
         Ok(())
     }
 }
