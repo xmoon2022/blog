@@ -1,9 +1,11 @@
 use anyhow::{Context, Result, bail, ensure};
+use regex::Regex;
 use serde::Deserialize;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tempfile::tempdir;
 
 #[derive(Debug)]
 pub struct Config {
@@ -209,16 +211,68 @@ fn copy_tree_if_exists(src: PathBuf, dst: PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn extract_body(document: &str) -> Result<String> {
+    let re = Regex::new(r"(?is)<body>\s*(.*?)\s*</body>").unwrap();
+    let body = re
+        .captures(document)
+        .ok_or_else(|| anyhow::anyhow!("missing body"))?;
+    Ok(body[1].to_string())
+}
+
+// fn strip_duplicate_title(body: &str, title: &str) -> Result<String> {
+//     let re = Regex::new(r"(?is)\s*<h[1-6][^>]*>(.*?)</h[1-6]>\s*").unwrap();
+//     let
+// }
+
+fn render_typst_html(post: &Post) -> Result<String> {
+    let tmpdir = tempdir()?;
+    let path = tmpdir.path().join(format!("{}.html", post.slug));
+    let outputs = Command::new("typst")
+        .args([
+            "compile",
+            "--features",
+            "html",
+            "--format",
+            "html",
+            "--root",
+            ".",
+            post.source.to_str().unwrap(),
+            path.to_str().unwrap(),
+        ])
+        .current_dir(".")
+        .output()
+        .context("执行 typst compile 失败")?;
+
+    ensure!(
+        outputs.status.success(),
+        "typst compile 失败:\n{}",
+        String::from_utf8_lossy(&outputs.stderr)
+    );
+
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("读取文件失败: {}", path.display()))?;
+    let body = extract_body(&content).context("解析失败")?;
+    Ok(body)
+}
+
+fn render_post_page(site: SiteConfigFile, post: Post, article_html: String) -> Result<String> {
+    let tags = String::from(" ").push(format!(<span>#{escape(tag)}</span>));
+}
+
 fn build(siteconfig: SiteConfigFile, site_path: PathBuf, dist_path: PathBuf) -> Result<()> {
     let posts = discover().context("discover运行失败")?;
     let mut published_posts: Vec<&Post> = posts.iter().filter(|t| !t.draft).collect();
     published_posts.sort_by(|a, b| a.date.cmp(&b.date));
     clean_dir(&site_path)?;
     clean_dir(&dist_path)?;
-    let mut assets_path = site_path;
+    let mut assets_path = site_path.clone();
     assets_path.push("assets");
     copy_tree_if_exists(PathBuf::from("assets"), assets_path)?;
-    for post in published_posts {}
+    for post in published_posts {
+        let article_html = render_typst_html(post)?;
+        fs::create_dir_all(site_path.join("posts").join(post.slug.clone()))?;
+        // fs::create_dir_all(site_path.join("downloads").join(post.slug.clone()))?;
+    }
     Ok(())
 }
 
