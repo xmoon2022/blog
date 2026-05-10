@@ -3,6 +3,7 @@ use regex::Regex;
 use serde::Deserialize;
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::tempdir;
@@ -219,10 +220,13 @@ fn extract_body(document: &str) -> Result<String> {
     Ok(body[1].to_string())
 }
 
-// fn strip_duplicate_title(body: &str, title: &str) -> Result<String> {
-//     let re = Regex::new(r"(?is)\s*<h[1-6][^>]*>(.*?)</h[1-6]>\s*").unwrap();
-//     let
-// }
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
 
 fn render_typst_html(post: &Post) -> Result<String> {
     let tmpdir = tempdir()?;
@@ -255,8 +259,45 @@ fn render_typst_html(post: &Post) -> Result<String> {
     Ok(body)
 }
 
-fn render_post_page(site: SiteConfigFile, post: Post, article_html: String) -> Result<String> {
-    let tags = String::from(" ").push(format!(<span>#{escape(tag)}</span>));
+fn render_post_page(site: &SiteConfigFile, post: &Post, article_html: String) -> Result<String> {
+    let tags: String = post
+        .tags
+        .iter()
+        .map(|tag| format!("<span>#{}</span>", escape_html(tag)))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let body = format!(
+        r#"
+<main>
+  <article>
+    <header>
+      <h1 class="post-title">{}</h1>
+      <div class="post-meta">
+        <time datetime="{}">{}</time>
+        {}
+      </div>
+    </header>
+
+    <div class="post-content">
+      {}
+    </div>
+
+    <nav class="post-actions" aria-label="文章操作">
+      <a href="../../">返回首页</a>
+      <a href="../../downloads/{}.md">Markdown 版本</a>
+    </nav>
+  </article>
+</main>
+"#,
+        escape_html(&post.title),
+        (&post.date),
+        (&post.date),
+        escape_html(&tags),
+        article_html,
+        (&post.slug),
+    );
+    Ok(body)
 }
 
 fn build(siteconfig: SiteConfigFile, site_path: PathBuf, dist_path: PathBuf) -> Result<()> {
@@ -270,9 +311,14 @@ fn build(siteconfig: SiteConfigFile, site_path: PathBuf, dist_path: PathBuf) -> 
     copy_tree_if_exists(PathBuf::from("assets"), assets_path)?;
     for post in published_posts {
         let article_html = render_typst_html(post)?;
-        fs::create_dir_all(site_path.join("posts").join(post.slug.clone()))?;
-        // fs::create_dir_all(site_path.join("downloads").join(post.slug.clone()))?;
+        let post_dir = site_path.join("posts").join(post.slug.clone());
+        fs::create_dir_all(&post_dir)?;
+        fs::File::create(post_dir.join("index.html"))?
+            .write_all(render_post_page(&siteconfig, post, article_html)?.as_bytes())?;
     }
+    fs::File::create(site_path.join(".nojekyll"))?;
+    let mut robot_file = fs::File::create(site_path.join("robots.txt"))?;
+    robot_file.write_all(b"User-agent: *\nAllow: /")?;
     Ok(())
 }
 
