@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail, ensure};
 use regex::Regex;
 use serde::Deserialize;
+use serde::Deserializer;
+use serde::de;
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -59,18 +61,17 @@ pub struct SiteConfigFile {
     description: String,
     author: String,
     language: String,
-    base_url: Option<String>,
+    base_url: String,
 }
 
 impl SiteConfigFile {
     fn new(path: PathBuf) -> Result<SiteConfigFile> {
         let content = std::fs::read_to_string(path).context("没有找到 site.toml")?;
         let file_config: SiteConfigFile = toml::from_str(&content).context("解析site.toml失败")?;
-        let base_url = std::env::var("SITE_URL")
+        let url = std::env::var("SITE_URL")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .or(file_config.base_url)
-            .unwrap_or_default()
+            .unwrap_or(file_config.base_url)
             .trim_end_matches('/')
             .to_string();
         Ok(SiteConfigFile {
@@ -78,7 +79,7 @@ impl SiteConfigFile {
             description: file_config.description,
             author: file_config.author,
             language: file_config.language,
-            base_url: Some(base_url),
+            base_url: url,
         })
     }
 }
@@ -220,6 +221,12 @@ fn extract_body(document: &str) -> Result<String> {
     Ok(body[1].to_string())
 }
 
+fn strip_duplicate_title(body: &str, title: &str) -> Result<String> {
+    let re = Regex::new(r"(?is)\s*<h[1-6][^>]*>(.*?)</h[1-6]>\s*").unwrap();
+    let body = re.captures(body).ok_or_else(|| anyhow!("missing body"))?;
+    Ok(body)
+}
+
 fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -259,7 +266,7 @@ fn render_typst_html(post: &Post) -> Result<String> {
     Ok(body)
 }
 
-fn render_post_page(site: &SiteConfigFile, post: &Post, article_html: String) -> Result<String> {
+fn render_post_body(post: &Post, article_html: String) -> String {
     let tags: String = post
         .tags
         .iter()
@@ -278,11 +285,9 @@ fn render_post_page(site: &SiteConfigFile, post: &Post, article_html: String) ->
         {}
       </div>
     </header>
-
-    <div class="post-content">
+    <div class="post-body">
       {}
     </div>
-
     <nav class="post-actions" aria-label="文章操作">
       <a href="../../">返回首页</a>
       <a href="../../downloads/{}.md">Markdown 版本</a>
@@ -293,11 +298,91 @@ fn render_post_page(site: &SiteConfigFile, post: &Post, article_html: String) ->
         escape_html(&post.title),
         (&post.date),
         (&post.date),
-        escape_html(&tags),
+        tags,
         article_html,
         (&post.slug),
     );
-    Ok(body)
+    body
+}
+
+fn render_shell(
+    site: &SiteConfigFile,
+    title: &str,
+    description: &str,
+    depth: usize,
+    body: &str,
+    canonical_path: Option<&str>,
+) -> Result<String> {
+    let prefix = "../".repeat(depth);
+    let home_href = if prefix.is_empty() { "./" } else { &prefix };
+    let canonical_path = canonical_path.unwrap_or("");
+    let canonical = if canonical_path.is_empty() {
+        site.base_url.clone()
+    } else {
+        absolute_url(site, canonical_path)
+    };
+    let canonical_tag = if canonical.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<link rel="canonical" href="{}">"#,
+            escape_html(&canonical)
+        )
+    };
+    let html = format!(
+        r#"
+        <!doctype html>
+        <html lang="{}">
+        <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>{}</title>
+          <meta name="description" content="{}">
+          {}
+          <link rel="alternate" type="application/rss+xml" title="{}" href="{}feed.xml">
+          <link rel="stylesheet" href="{}assets/style.css">
+        </head>
+        <body>
+          <header class="site-header">
+            <p class="site-title"><a href="{}">{}</a></p>
+            <p class="site-description">{}</p>
+          </header>
+        {}
+          <footer class="site-footer">
+            <span>{}</span>
+          </footer>
+        </body>
+        </html>
+"#,
+        escape_html(&site.language),
+        escape_html(&title),
+        escape_html(&description),
+        canonical_tag,
+        escape_html(&site.title),
+        prefix,
+        prefix,
+        home_href,
+        escape_html(&site.title),
+        escape_html(&site.description),
+        body.trim_end(),
+        escape_html(&site.author)
+    )
+    .trim_start()
+    .to_string();
+    Ok(html)
+}
+
+fn absolute_url(site: &SiteConfigFile, path: &str) -> String {
+    let path = path.trim_matches('/');
+    let base = site.base_url.as_str();
+    if base.is_empty() {
+        return String::new();
+    }
+    if path.is_empty() {
+        format!("{base}/")
+    } else {
+        format!("{base}/{path}")
+    }
 }
 
 fn build(siteconfig: SiteConfigFile, site_path: PathBuf, dist_path: PathBuf) -> Result<()> {
@@ -314,7 +399,18 @@ fn build(siteconfig: SiteConfigFile, site_path: PathBuf, dist_path: PathBuf) -> 
         let post_dir = site_path.join("posts").join(post.slug.clone());
         fs::create_dir_all(&post_dir)?;
         fs::File::create(post_dir.join("index.html"))?
-            .write_all(render_post_page(&siteconfig, post, article_html)?.as_bytes())?;
+            // .write_all(render_post_body(post, article_html)?.as_bytes())?;
+            .write_all(
+                render_shell(
+                    &siteconfig,
+                    &format!("{} | {}", post.title, siteconfig.title),
+                    &post.description,
+                    2,
+                    &render_post_body(post, article_html),
+                    post_dir.to_str(),
+                )?
+                .as_bytes(),
+            )?;
     }
     fs::File::create(site_path.join(".nojekyll"))?;
     let mut robot_file = fs::File::create(site_path.join("robots.txt"))?;
