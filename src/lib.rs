@@ -1,13 +1,15 @@
+#![allow(unused)]
+
 use anyhow::{Context, Result, bail, ensure};
+use chrono::NaiveDate;
 use regex::Regex;
 use serde::Deserialize;
-use serde::Deserializer;
-use serde::de;
 use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr;
 use tempfile::tempdir;
 
 #[derive(Debug)]
@@ -89,7 +91,7 @@ struct Post {
     source: std::path::PathBuf,
     slug: String,
     title: String,
-    date: String,
+    date: NaiveDate,
     description: String,
     tags: Vec<String>,
     draft: bool,
@@ -158,7 +160,7 @@ impl Post {
             source,
             slug: slug.to_string(),
             title: title.to_string(),
-            date: date.to_string(),
+            date: NaiveDate::from_str(date)?,
             description: description.to_string(),
             tags,
             draft,
@@ -177,6 +179,19 @@ fn discover() -> Result<Vec<Post>> {
         }
     }
     Ok(posts)
+}
+
+fn run_command(program: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("执行命令失败: {}", program))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("命令执行失败: {}\n{}", program, stderr);
+    }
+    let stdout = String::from_utf8(output.stdout).context("命令输出不是合法 UTF-8")?;
+    Ok(stdout)
 }
 
 fn clean_dir(path: &PathBuf) -> Result<()> {
@@ -222,9 +237,31 @@ fn extract_body(document: &str) -> Result<String> {
 }
 
 fn strip_duplicate_title(body: &str, title: &str) -> Result<String> {
-    let re = Regex::new(r"(?is)\s*<h[1-6][^>]*>(.*?)</h[1-6]>\s*").unwrap();
-    let body = re.captures(body).ok_or_else(|| anyhow!("missing body"))?;
-    Ok(body)
+    let heading_re = Regex::new(r"(?is)^\s*<h[1-6][^>]*>(.*?)</h[1-6]>\s*")?;
+    let tag_re = Regex::new(r"(?is)<[^>]+>")?;
+
+    let Some(caps) = heading_re.captures(body) else {
+        return Ok(body.to_string());
+    };
+
+    let whole_match = caps.get(0).unwrap();
+    let heading_html = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+
+    let heading_text = tag_re.replace_all(heading_html, "");
+    let heading_text = unescape_html(&heading_text);
+
+    let normalized_heading = heading_text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let normalized_title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    if normalized_heading == normalized_title {
+        Ok(body[whole_match.end()..].trim_start().to_string())
+    } else {
+        Ok(body.to_string())
+    }
 }
 
 fn escape_html(s: &str) -> String {
@@ -235,11 +272,21 @@ fn escape_html(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
+fn unescape_html(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
 fn render_typst_html(post: &Post) -> Result<String> {
     let tmpdir = tempdir()?;
     let path = tmpdir.path().join(format!("{}.html", post.slug));
-    let outputs = Command::new("typst")
-        .args([
+    let output = run_command(
+        "typst",
+        &[
             "compile",
             "--features",
             "html",
@@ -249,24 +296,15 @@ fn render_typst_html(post: &Post) -> Result<String> {
             ".",
             post.source.to_str().unwrap(),
             path.to_str().unwrap(),
-        ])
-        .current_dir(".")
-        .output()
-        .context("执行 typst compile 失败")?;
-
-    ensure!(
-        outputs.status.success(),
-        "typst compile 失败:\n{}",
-        String::from_utf8_lossy(&outputs.stderr)
-    );
-
+        ],
+    )?;
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("读取文件失败: {}", path.display()))?;
     let body = extract_body(&content).context("解析失败")?;
-    Ok(body)
+    strip_duplicate_title(&body, &post.title)
 }
 
-fn render_post_body(post: &Post, article_html: String) -> String {
+fn render_post_page(site: &SiteConfigFile, post: &Post, article_html: String) -> Result<String> {
     let tags: String = post
         .tags
         .iter()
@@ -297,12 +335,24 @@ fn render_post_body(post: &Post, article_html: String) -> String {
 "#,
         escape_html(&post.title),
         (&post.date),
-        (&post.date),
+        format_date(post.date),
         tags,
         article_html,
         (&post.slug),
     );
-    body
+    let cannoical_path = format!("posts/{}", post.slug);
+    render_shell(
+        site,
+        &format!("{} | {}", post.title, site.title),
+        &post.description,
+        2,
+        &body,
+        Some(&cannoical_path),
+    )
+}
+
+fn format_date(date: NaiveDate) -> String {
+    date.format("%Y年%-m月%-d日").to_string()
 }
 
 fn render_shell(
@@ -355,8 +405,8 @@ fn render_shell(
         </html>
 "#,
         escape_html(&site.language),
-        escape_html(&title),
-        escape_html(&description),
+        escape_html(title),
+        escape_html(description),
         canonical_tag,
         escape_html(&site.title),
         prefix,
@@ -385,32 +435,109 @@ fn absolute_url(site: &SiteConfigFile, path: &str) -> String {
     }
 }
 
+fn strip_post_metadata(source: &str) -> Result<String> {
+    let mut output = Vec::new();
+    let mut skip = false;
+    for line in source.lines() {
+        let stripped = line.trim_start();
+        if !skip && stripped.starts_with("#metadata(") {
+            skip = true;
+            if line.contains("<post-meta>") {
+                skip = false;
+            }
+            continue;
+        }
+        if skip {
+            if line.contains("<post-meta>") {
+                skip = false;
+            }
+            continue;
+        }
+        output.push(line);
+    }
+    let joined = output.join("\n");
+    Ok(format!("{}\n", joined.trim_start()))
+}
+
+fn render_markdown_with_pandoc(post: &Post, source: &str) -> Result<Option<String>> {
+    let tmpdir = tempdir()?;
+    let path = tmpdir.path().join(format!("{}.md", post.slug));
+    let typ_path = tmpdir.path().join("tmp.typ");
+    fs::File::create(&typ_path)?.write_all(source.as_bytes());
+    run_command(
+        "pandoc",
+        &[
+            "--from",
+            "typst",
+            "--to",
+            "gfm",
+            "--wrap",
+            "none",
+            "--resource-path",
+            ".",
+            typ_path.to_str().unwrap(),
+            "-",
+            "--output",
+            path.to_str().unwrap(),
+        ],
+    )?;
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("读取文件失败: {}", path.display()))?;
+    Ok(Some(content))
+}
+
+fn yaml_quote(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn render_markdown(post: &Post, site: &SiteConfigFile) -> Result<String> {
+    let source = strip_post_metadata(&fs::read_to_string(&post.source)?)?;
+    let body = render_markdown_with_pandoc(post, &source)?.unwrap();
+    let source_url = absolute_url(site, &format!("posts/{}/", post.slug));
+    let mut frontmatter = vec![
+        "---".to_string(),
+        format!("title: \"{}\"", yaml_quote(&post.title)),
+        format!("date: \"{}\"", post.date),
+        "tags:".to_string(),
+    ];
+    if !post.tags.is_empty() {
+        frontmatter.extend(
+            post.tags
+                .iter()
+                .map(|tag| format!("  - \"{}\"", yaml_quote(tag))),
+        );
+    } else {
+        frontmatter.push(" []".to_string());
+    }
+    if !source_url.is_empty() {
+        frontmatter.push(format!("source: \"{}\"", yaml_quote(&source_url)));
+    }
+    frontmatter.push("---".to_string());
+    Ok(frontmatter.join("\n") + "\n\n" + body.trim() + "\n")
+}
+
 fn build(siteconfig: SiteConfigFile, site_path: PathBuf, dist_path: PathBuf) -> Result<()> {
     let posts = discover().context("discover运行失败")?;
     let mut published_posts: Vec<&Post> = posts.iter().filter(|t| !t.draft).collect();
     published_posts.sort_by(|a, b| a.date.cmp(&b.date));
     clean_dir(&site_path)?;
     clean_dir(&dist_path)?;
-    let mut assets_path = site_path.clone();
-    assets_path.push("assets");
+    let assets_path = site_path.join("assets");
     copy_tree_if_exists(PathBuf::from("assets"), assets_path)?;
+    let markdown_dir = site_path.join("downloads");
+    fs::create_dir_all(&markdown_dir)?;
+    fs::create_dir_all(&dist_path);
     for post in published_posts {
         let article_html = render_typst_html(post)?;
+        let markdown = render_markdown(post, &siteconfig)?;
         let post_dir = site_path.join("posts").join(post.slug.clone());
         fs::create_dir_all(&post_dir)?;
         fs::File::create(post_dir.join("index.html"))?
-            // .write_all(render_post_body(post, article_html)?.as_bytes())?;
-            .write_all(
-                render_shell(
-                    &siteconfig,
-                    &format!("{} | {}", post.title, siteconfig.title),
-                    &post.description,
-                    2,
-                    &render_post_body(post, article_html),
-                    post_dir.to_str(),
-                )?
-                .as_bytes(),
-            )?;
+            .write_all(render_post_page(&siteconfig, post, article_html)?.as_bytes())?;
+        fs::File::create(markdown_dir.join(format!("{}.md", post.slug.clone())))?
+            .write_all(markdown.as_bytes())?;
+        fs::File::create(dist_path.join(format!("{}.md", post.slug.clone())))?
+            .write_all(markdown.as_bytes())?;
     }
     fs::File::create(site_path.join(".nojekyll"))?;
     let mut robot_file = fs::File::create(site_path.join("robots.txt"))?;
