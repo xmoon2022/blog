@@ -2,6 +2,10 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::NaiveDate;
+use chrono::Utc;
+use quick_xml::Writer;
+use quick_xml::events::BytesText;
+use quick_xml::name;
 use regex::Regex;
 use serde::Deserialize;
 use std::env;
@@ -395,8 +399,7 @@ fn render_shell(
         <body>
           <header class="site-header">
             <p class="site-title"><a href="{}">{}</a></p>
-            <p class="site-description">{}</p>
-          </header>
+            <p class="site-description">{}</p> </header>
         {}
           <footer class="site-footer">
             <span>{}</span>
@@ -458,7 +461,6 @@ fn strip_post_metadata(source: &str) -> Result<String> {
     let joined = output.join("\n");
     Ok(format!("{}\n", joined.trim_start()))
 }
-
 fn render_markdown_with_pandoc(post: &Post, source: &str) -> Result<Option<String>> {
     let tmpdir = tempdir()?;
     let path = tmpdir.path().join(format!("{}.md", post.slug));
@@ -516,6 +518,79 @@ fn render_markdown(post: &Post, site: &SiteConfigFile) -> Result<String> {
     Ok(frontmatter.join("\n") + "\n\n" + body.trim() + "\n")
 }
 
+fn render_index_page(site: &SiteConfigFile, posts: &Vec<&Post>) -> Result<String> {
+    let mut items = posts
+        .iter()
+        .map(|post| {
+            format!(
+                r#"<li>
+  <h2><a href="posts/{}/">{}</a></h2>
+  <time datetime="{}">{}</time>
+  <p>{}</p>
+</li>"#,
+                escape_html(&post.slug),
+                escape_html(&post.title),
+                post.date.format("%Y-%m-%d"),
+                format_date(post.date),
+                escape_html(&post.description),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if items.is_empty() {
+        items = "<li>暂无文章。</li>".to_string();
+    }
+
+    let body = format!(
+        r#"<main>
+  <h1>{}</h1>
+  <p>{}</p>
+  <ul class="post-list">
+    {}
+  </ul>
+</main>"#,
+        escape_html(&site.title),
+        escape_html(&site.description),
+        items,
+    );
+    render_shell(site, &site.title, &site.description, 0, &body, None)
+}
+
+fn render_robots(site: &SiteConfigFile) -> String {
+    let mut robot = vec!["User-agent: *".to_string(), "Allow: /".to_string()];
+    if !site.base_url.is_empty() {
+        robot.push(format!("Sitemap: {}/sitemap.xml", site.base_url).to_string());
+    }
+    robot.join("\n") + "\n"
+}
+
+fn render_feed(site: &SiteConfigFile, posts: &Vec<&Post>) -> Result<String> {
+    let mut writer = Writer::new(Vec::new());
+    writer
+        .create_element("channel")
+        .write_inner_content(|writer| {
+            text_element(writer, "title", &site.title);
+            text_element(writer, "description", &site.description);
+            text_element(writer, "link", &site.base_url);
+            text_element(writer, "language", &site.language);
+            let latest = posts
+                .first()
+                .map(|post| post.date)
+                .unwrap_or_else(|| Utc::now().date_naive());
+            let last_build_date = latest.and_hms_opt(0, 0, 0).unwrap().and_utc().to_rfc2822();
+            Ok(())
+        })?;
+    Ok(String::new())
+}
+
+fn text_element<W: Write>(writer: &mut Writer<W>, name: &str, text: &str) -> quick_xml::Result<()> {
+    writer
+        .create_element(name)
+        .write_text_content(BytesText::new(text))?;
+    Ok(())
+}
+
 fn build(siteconfig: SiteConfigFile, site_path: PathBuf, dist_path: PathBuf) -> Result<()> {
     let posts = discover().context("discover运行失败")?;
     let mut published_posts: Vec<&Post> = posts.iter().filter(|t| !t.draft).collect();
@@ -527,7 +602,7 @@ fn build(siteconfig: SiteConfigFile, site_path: PathBuf, dist_path: PathBuf) -> 
     let markdown_dir = site_path.join("downloads");
     fs::create_dir_all(&markdown_dir)?;
     fs::create_dir_all(&dist_path);
-    for post in published_posts {
+    for post in &published_posts {
         let article_html = render_typst_html(post)?;
         let markdown = render_markdown(post, &siteconfig)?;
         let post_dir = site_path.join("posts").join(post.slug.clone());
@@ -539,9 +614,13 @@ fn build(siteconfig: SiteConfigFile, site_path: PathBuf, dist_path: PathBuf) -> 
         fs::File::create(dist_path.join(format!("{}.md", post.slug.clone())))?
             .write_all(markdown.as_bytes())?;
     }
+    fs::File::create(site_path.join("index.html"))?
+        .write_all(render_index_page(&siteconfig, &published_posts)?.as_bytes());
+    fs::File::create(site_path.join("feed.xml"))?
+        .write_all(render_feed(&siteconfig, &published_posts)?.as_bytes());
+    fs::File::create(site_path.join("robots.txt"))?
+        .write_all(render_robots(&siteconfig).as_bytes())?;
     fs::File::create(site_path.join(".nojekyll"))?;
-    let mut robot_file = fs::File::create(site_path.join("robots.txt"))?;
-    robot_file.write_all(b"User-agent: *\nAllow: /")?;
     Ok(())
 }
 
